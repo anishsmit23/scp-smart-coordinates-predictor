@@ -1,0 +1,39 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Runtime artifacts
+logs/
+outputs/
+checkpoints/
+training_runs*/
+
+# TensorBoard
+runs/
+
+# Local datasets and caches
+data/nuscenes/samples/
+data/nuscenes/sweeps/
+data/nuscenes/maps/
+data/nuscenes/v1.0-*/
+data/nuscenes/processed_cache.pkl
+
+# Notebook checkpoints
+.ipynb_checkpoints/
