@@ -1,0 +1,93 @@
+project:
+  name: SCP
+  description: Smart Coordinates Predictor for Pedestrian and Cyclist Trajectory Prediction
+
+dataset:
+  dataroot: ./data/nuscenes
+  version: v1.0-mini
+  target_hz: 2.0
+  step_seconds: 0.5
+  past_seconds: 2.0
+  future_seconds: 3.0
+  min_displacement: 0.05
+  supported_categories:
+    - human.pedestrian
+    - vehicle.bicycle
+  past_steps: 4
+  future_steps: 6
+  batch_size: 32
+  num_workers: 6
+  prefetch_factor: 4
+  pin_memory: true
+  shuffle: true
+
+model:
+  input_dim: 10
+  embedding_dim: 64
+  hidden_dim: 128
+  lstm_layers: 2
+  transformer_heads: 4
+  transformer_layers: 2
+  dropout: 0.2
+  num_modes: 6
+  combined_feature_dim: 160
+
+social_pooling:
+  neighbor_radius: 2.0
+  pooling_type: grid
+  social_dim: 32
+  grid_size: 8
+
+training:
+  epochs: 80
+  learning_rate: 0.0003
+  weight_decay: 0.0003
+  gradient_clip: 5.0
+  teacher_forcing_ratio: 0.1
+  seed: 42
+  val_split: 0.05
+  use_amp: true
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.005
+
+scheduler:
+  type: CosineAnnealingLR
+  t_max: 80
+  eta_min: 0.00001
+
+optimizer:
+  type: AdamW
+
+loss:
+  use_ade: true
+  use_fde: true
+  multimodal: true
+  lambda_reg: 0.02
+  lambda_div: 0.08
+  lambda_fde: 0.6
+  lambda_smooth: 0.03
+  lambda_first: 0.5
+  lambda_path: 0.3
+  lambda_heading: 0.3
+  select_with_fde: 0.4
+  early_step_bias: 0.8
+  hard_mining_alpha: 0.4
+
+checkpoint:
+  save_dir: ./checkpoints
+  filename: latest.pth
+  save_frequency: 5
+
+logging:
+  log_dir: ./logs
+  use_tensorboard: true
+  print_frequency: 10
+
+device:
+  use_gpu: true
+  gpu_id: 0
+
+performance:
+  cpu_threads: 12
+  cudnn_benchmark: true
+
