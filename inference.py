@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import torch
 
 from configurations.config_loader import load_config
 from models.model_builder import TrajectoryPredictionModel
-from utilities.checkpoint import CheckpointManager
 from utilities.dataset import NuScenesTrajectoryDataset
 from utilities.device import get_device
 from utilities.random_seed import set_seed
@@ -50,17 +50,10 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to save plotted visualization image",
     )
     parser.add_argument(
-        "--plot_mode",
-        type=str,
-        default="best",
-        choices=("best", "all", "mean", "mode"),
-        help="Plotting mode for multimodal predictions",
-    )
-    parser.add_argument(
-        "--mode_index",
+        "--num_trajectories",
         type=int,
-        default=0,
-        help="Mode index to plot when --plot_mode=mode",
+        default=1,
+        help="Number of predicted trajectories to output and plot",
     )
     parser.add_argument(
         "--no_show",
@@ -157,34 +150,101 @@ def predict_futures(model: TrajectoryPredictionModel, past: torch.Tensor, device
     return predictions.detach().cpu()
 
 
-def select_plot_prediction(
+def _extract_state_dict(checkpoint: Dict) -> Dict[str, torch.Tensor]:
+    """Extract model state dict from checkpoint payload."""
+    if "model_state_dict" in checkpoint:
+        return checkpoint["model_state_dict"]
+
+    legacy_components = (
+        "encoder",
+        "social_pool",
+        "transformer",
+        "goal_predictor",
+        "goal_condition",
+        "decoder",
+    )
+    if not all(component in checkpoint for component in legacy_components):
+        raise KeyError("Missing 'model_state_dict' and legacy model components in checkpoint")
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    for component in legacy_components:
+        component_state = checkpoint[component]
+        for key, value in component_state.items():
+            state_dict[f"{component}.{key}"] = value
+    return state_dict
+
+
+def _resolve_checkpoint_payload(
+    checkpoint_dir: str,
+    preferred_name: str,
+    fallback_name: str,
+) -> Tuple[Dict, str]:
+    """Load preferred checkpoint payload with fallback support."""
+    preferred_path = Path(checkpoint_dir) / preferred_name
+    if preferred_path.exists():
+        return torch.load(preferred_path, map_location="cpu"), preferred_name
+
+    fallback_path = Path(checkpoint_dir) / fallback_name
+    if fallback_path.exists():
+        return torch.load(fallback_path, map_location="cpu"), fallback_name
+
+    raise FileNotFoundError(
+        f"Checkpoint not found in '{checkpoint_dir}'. Tried: {preferred_name}, {fallback_name}"
+    )
+
+
+def _align_config_with_checkpoint(config: Dict, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Align model dimensions in config with checkpoint tensor shapes."""
+    model_cfg = config.setdefault("model", {})
+
+    mode_weight_key = "decoder.mode_embedding.weight"
+    if mode_weight_key in state_dict:
+        checkpoint_num_modes = int(state_dict[mode_weight_key].shape[0])
+        config_num_modes = int(model_cfg.get("num_modes", checkpoint_num_modes))
+        if checkpoint_num_modes != config_num_modes:
+            print(
+                "Overriding config model.num_modes to match checkpoint: "
+                f"{config_num_modes} -> {checkpoint_num_modes}"
+            )
+            model_cfg["num_modes"] = checkpoint_num_modes
+
+
+def select_top_trajectories(
     predictions: torch.Tensor,
     future: torch.Tensor,
-    plot_mode: str,
-    mode_index: int,
-) -> Tuple[torch.Tensor, Optional[int]]:
-    """Select which predicted trajectory to visualize for a single sample."""
+    num_trajectories: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select top-K trajectories by ADE against ground truth future."""
+    k = max(1, int(num_trajectories))
+
     if predictions.ndim == 2:
-        return predictions, None
+        return predictions.unsqueeze(0), torch.tensor([0], dtype=torch.long)
 
-    if plot_mode == "all":
-        return predictions, None
+    if predictions.ndim == 3:
+        if future.ndim != 2:
+            raise ValueError("future must have shape (T, 2) for single-sample predictions")
+        gt = future.unsqueeze(0).expand(predictions.size(0), -1, -1)
+        ade = torch.norm(predictions - gt, dim=-1).mean(dim=-1)
+        topk = min(k, predictions.size(0))
+        top_indices = torch.topk(ade, k=topk, largest=False).indices
+        return predictions[top_indices], top_indices
 
-    if plot_mode == "mean":
-        return predictions.mean(dim=0), None
+    if predictions.ndim != 4:
+        raise ValueError(
+            "predictions must have shape (B, T, 2), (M, T, 2), or (B, M, T, 2), "
+            f"got {tuple(predictions.shape)}"
+        )
 
-    if plot_mode == "mode":
-        idx = int(mode_index)
-        idx = max(0, min(idx, predictions.size(0) - 1))
-        return predictions[idx], idx
+    if future.ndim != 3:
+        raise ValueError("future must have shape (B, T, 2) for batched multimodal predictions")
 
-    # Default: use the best mode by ADE.
-    if future.ndim != 2:
-        raise ValueError("future must have shape (T, 2) for plot_mode=best")
-    gt = future.unsqueeze(0).expand(predictions.size(0), -1, -1)
-    disp = torch.norm(predictions - gt, dim=-1).mean(dim=-1)
-    best_idx = int(torch.argmin(disp).item())
-    return predictions[best_idx], best_idx
+    gt = future.unsqueeze(1)
+    ade = torch.norm(predictions - gt, dim=-1).mean(dim=-1)
+    topk = min(k, predictions.size(1))
+    top_indices = torch.topk(ade, k=topk, dim=1, largest=False).indices
+    gather_idx = top_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, predictions.size(2), predictions.size(3))
+    selected = torch.gather(predictions, dim=1, index=gather_idx)
+    return selected, top_indices
 
 
 def main() -> None:
@@ -212,11 +272,7 @@ def main() -> None:
     # Pick device from config.
     device = get_device(config)
 
-    # Build model.
-    model = TrajectoryPredictionModel(config=config).to(device)
-    model.eval()
-
-    # 2) Load checkpoint.
+    # 2) Resolve and load checkpoint payload.
     checkpoint_cfg = config.get("checkpoint", {})
     checkpoint_dir = str(checkpoint_cfg.get("save_dir", "checkpoints"))
     latest_name = str(checkpoint_cfg.get("filename", "latest.pth"))
@@ -225,20 +281,19 @@ def main() -> None:
     preferred_name = best_name if args.checkpoint_mode == "best" else latest_name
     fallback_name = latest_name if args.checkpoint_mode == "best" else best_name
 
-    try:
-        checkpoint_manager = CheckpointManager(
-            checkpoint_dir=checkpoint_dir,
-            filename=preferred_name,
-        )
-        loaded_epoch = checkpoint_manager.load(model=model, optimizer=None)
-        loaded_name = preferred_name
-    except FileNotFoundError:
-        checkpoint_manager = CheckpointManager(
-            checkpoint_dir=checkpoint_dir,
-            filename=fallback_name,
-        )
-        loaded_epoch = checkpoint_manager.load(model=model, optimizer=None)
-        loaded_name = fallback_name
+    checkpoint_payload, loaded_name = _resolve_checkpoint_payload(
+        checkpoint_dir=checkpoint_dir,
+        preferred_name=preferred_name,
+        fallback_name=fallback_name,
+    )
+    state_dict = _extract_state_dict(checkpoint_payload)
+    loaded_epoch = int(checkpoint_payload.get("epoch", 0))
+
+    # Build model after aligning config with checkpoint architecture.
+    _align_config_with_checkpoint(config=config, state_dict=state_dict)
+    model = TrajectoryPredictionModel(config=config).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
 
     # 3) Prepare input tensors.
     if args.sample_indices.strip():
@@ -269,25 +324,27 @@ def main() -> None:
 
     # 4) Predict future paths.
     predicted_paths = predict_futures(model=model, past=past, device=device)
+    selected_paths, selected_indices = select_top_trajectories(
+        predictions=predicted_paths,
+        future=future,
+        num_trajectories=args.num_trajectories,
+    )
 
     print(f"Loaded checkpoint file: {loaded_name}")
     print(f"Loaded checkpoint epoch: {loaded_epoch}")
     print(f"Sample indices: {sample_indices}")
     print(f"Agent IDs: {agent_ids}")
-    print(f"Predicted trajectories shape: {tuple(predicted_paths.shape)}")
-    print(predicted_paths)
+    print(f"Raw predicted trajectories shape: {tuple(predicted_paths.shape)}")
+    print(f"Output trajectories shape: {tuple(selected_paths.shape)}")
+    print(f"Selected trajectory indices: {selected_indices.tolist()}")
+    print(selected_paths)
 
     # 5) Plot first sample only.
-    first_pred_all = predicted_paths[0]
+    first_pred_all = selected_paths[0] if selected_paths.ndim == 4 else selected_paths
     first_past = past[0, :, :2]
     first_future = future[0]
     first_origin = origins[0]
-    first_pred, selected_mode_idx = select_plot_prediction(
-        predictions=first_pred_all,
-        future=first_future,
-        plot_mode=args.plot_mode,
-        mode_index=args.mode_index,
-    )
+    first_pred = first_pred_all
     if args.plot_frame == "absolute":
         first_past = NuScenesTrajectoryDataset.denormalize_with_origin(first_past, first_origin)
         first_future = NuScenesTrajectoryDataset.denormalize_with_origin(first_future, first_origin)
@@ -300,20 +357,14 @@ def main() -> None:
 
     if args.past_points > 0:
         first_past = first_past[-args.past_points :]
-    if selected_mode_idx is not None:
-        print(f"Selected plotted mode index: {selected_mode_idx}")
+    plotted_indices = selected_indices[0].tolist() if selected_indices.ndim == 2 else selected_indices.tolist()
+    print(f"Plotted trajectory indices: {plotted_indices}")
     print(f"Plot frame: {args.plot_frame}")
     print("First sample absolute predicted trajectory (meters):")
     print(first_pred)
 
-    if args.plot_mode == "all":
-        plot_title = "SCP Trajectory Inference (All Modes)"
-    elif args.plot_mode == "mean":
-        plot_title = "SCP Trajectory Inference (Mean Mode)"
-    elif args.plot_mode == "mode":
-        plot_title = f"SCP Trajectory Inference (Mode {selected_mode_idx})"
-    else:
-        plot_title = f"SCP Trajectory Inference (Best Mode {selected_mode_idx})"
+    plotted_count = first_pred.size(0) if first_pred.ndim == 3 else 1
+    plot_title = f"SCP Trajectory Inference (Top {plotted_count} Trajectories)"
 
     if args.plot_frame == "local":
         plot_title = f"{plot_title} | Local Frame"
