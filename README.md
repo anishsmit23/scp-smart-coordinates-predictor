@@ -445,7 +445,7 @@ ls data/nuscenes/v1.0-mini/  # Should show dataset files
 AI/ML Engineer
 
 [![GitHub](https://img.shields.io/badge/GitHub-anishsmit23-black?style=flat&logo=github)](https://github.com/anishsmit23)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat&logo=linkedin)](https://linkedin.com/in/anishsmit23)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat&logo=linkedin)](www.linkedin.com/in/anish55)
 
 </div>
 
